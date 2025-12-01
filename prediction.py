@@ -3,16 +3,16 @@
 """
 MatBench mp_gap:
 - Load official train/test splits
-- Featurize structures via composition (Magpie features)
+- Featurize structures/compositions with simple physics-inspired stats
 - Train a suite of models
 - Compute MAE on the test set for each fold and each model
 
 Requires:
-    pip install matbench matminer scikit-learn
+    pip install matbench scikit-learn pymatgen
 """
 
 from matbench.bench import MatbenchBenchmark
-from matminer.featurizers.composition import ElementProperty
+from pymatgen.core import Composition, Element
 
 import numpy as np
 import pandas as pd
@@ -109,31 +109,53 @@ def get_matbench_splits(dataset_name="matbench_mp_gap"):
 
 
 # -------------------------------------------------------------------
-# 2. Featurization: structures/compositions → Magpie features
+# 2. Featurization: structures/compositions → simple numeric features
 # -------------------------------------------------------------------
-def make_featurizer():
-    """Create a composition featurizer (Magpie preset)."""
-    featurizer = ElementProperty.from_preset("magpie")
-    return featurizer
-
-
-def featurize_series_to_magpie(X, featurizer):
+def featurize_structures_simple(X):
     """
-    X: iterable of inputs (pymatgen Structures, Composition objects, or strings)
-    Returns: np.ndarray of shape (n_samples, n_features)
+    Very simple, robust features from composition:
+
+    For each structure/composition, compute:
+        - n_atoms: total number of atoms
+        - mean_Z: mean atomic number
+        - mean_atomic_mass: mean atomic mass (amu)
+
+    X: iterable of objects, each either:
+        - a pymatgen Structure with .composition
+        - a pymatgen Composition
+        - a string formula
+
+    Returns: np.ndarray of shape (n_samples, 3)
     """
-    comp_strings = []
+    features = []
+
     for x in X:
-        # For structure objects with .composition attribute
-        if hasattr(x, "composition"):
-            comp = x.composition.reduced_formula
+        # Get a Composition object
+        if hasattr(x, "composition"):  # Structure or similar
+            comp = x.composition
         else:
-            comp = str(x)
-        comp_strings.append(comp)
+            comp = Composition(str(x))
 
-    # featurize_many returns a list-of-lists (or np.ndarray-like)
-    X_feat = featurizer.featurize_many(comp_strings, ignore_errors=True)
-    return np.array(X_feat, dtype=float)
+        # Total atom count
+        total_atoms = comp.num_atoms
+
+        # Aggregate Z and mass
+        z_sum = 0.0
+        mass_sum = 0.0
+        atom_count = 0.0
+
+        for el, amt in comp.items():
+            # el is a pymatgen Element
+            z_sum += el.Z * amt
+            mass_sum += float(el.atomic_mass) * amt
+            atom_count += amt
+
+        mean_Z = z_sum / atom_count if atom_count > 0 else 0.0
+        mean_mass = mass_sum / atom_count if atom_count > 0 else 0.0
+
+        features.append([total_atoms, mean_Z, mean_mass])
+
+    return np.array(features, dtype=float)
 
 
 # -------------------------------------------------------------------
@@ -165,9 +187,6 @@ def run_model_suite_on_splits(splits):
     # Keep track of MAE per model per fold
     mae_scores = {name: [] for name in model_suite}
 
-    # One featurizer reused across folds
-    featurizer = make_featurizer()
-
     for fold_name, fold_data in splits.items():
         print("\n" + "#" * 80)
         print(f"Running models for fold: {fold_name}")
@@ -182,9 +201,9 @@ def run_model_suite_on_splits(splits):
         y_test_arr = np.array(y_test, dtype=float)
 
         # ----- Featurize -----
-        print("Featurizing train and test compositions...")
-        X_train_feat = featurize_series_to_magpie(X_train, featurizer)
-        X_test_feat = featurize_series_to_magpie(X_test, featurizer)
+        print("Featurizing train and test compositions (simple stats)...")
+        X_train_feat = featurize_structures_simple(X_train)
+        X_test_feat = featurize_structures_simple(X_test)
 
         # ----- Impute + scale -----
         imputer = SimpleImputer(strategy="median")
