@@ -27,3 +27,6 @@
 *.tar.gz
 *.tar.bz2
 *.csv
+*.cif
+
+work_*/

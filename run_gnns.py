@@ -1,49 +1,33 @@
 #!/usr/bin/env python
 """
-Run CGCNN / ALIGNN on JARVIS-style CSVs (like your test.csv).
+Train and test GNN models on JARVIS-style CSVs.
+
+This script provides a unified interface to train GNN models, save their weights,
+and run inference on test data.
 
 Assumes CSV columns (at minimum):
-    - 'jarvis_id'       : string ID, e.g. 'JVASP-9331'
+    - 'material_id' OR 'jarvis_id': string ID (e.g. 'mp-123' or 'JVASP-9331')
     - 'cif_structure'   : full CIF string
     - '<target-col>'    : numeric property to predict, e.g. 'formation_energy_peratom'
 
-You provide:
-    --train-csv path/to/train.csv
-    --test-csv  path/to/test.csv
-    --target-col formation_energy_peratom
-    --backend cgcnn|alignn|both
+Usage:
+    python run_gnns.py --model m3gnet --train-csv train.csv --test-csv test.csv \\
+                       --target-col formation_energy_peratom --work-dir ./output
 
-This script will:
+Supported models:
+    - m3gnet: M3GNet model using MatGL
+    - alignn: ALIGNN model
+    - cgcnn: CGCNN model
 
-1. Read train/test CSVs.
-2. Create two dataset folders:
-
-   work_dir/
-     ├─ cgcnn_dataset/
-     │    ├─ id_prop.csv      # id,target (ids = jarvis_id)
-     │    ├─ JVASP-9331.cif
-     │    ├─ JVASP-133335.cif
-     │    └─ ...
-     └─ alignn_dataset/
-          ├─ id_prop.csv      # jid,target (jids = jarvis_id)
-          ├─ JVASP-9331.cif
-          ├─ JVASP-133335.cif
-          └─ ...
-
-   - Train rows come first, then test rows (to control splits).
-   - n_train = len(train.csv), n_test = len(test.csv).
-
-3. Run:
-   - CGCNN:  python <cgcnn_root>/main.py ...
-   - ALIGNN: train_alignn.py --root_dir alignn_dataset --config config_alignn.json ...
-
-You must have:
-    - CGCNN repo clone (for --cgcnn-root) + atom_init.json
-    - alignn installed (pip install alignn jarvis-tools) for ALIGNN backend
+The script will:
+1. Train the specified GNN model on the training dataset
+2. Save the trained model weights to <work-dir>/<model>_weights/
+3. Load the saved weights and run inference on the test dataset
+4. Save predictions to <work-dir>/<model>_predictions.csv
 """
 
 import argparse
-import json
+import os
 import shutil
 from pathlib import Path
 from typing import Tuple
@@ -58,9 +42,10 @@ ALIGNN_CONFIG_TEMPLATE = {
     "dataset": "user_data",
     "id_tag": "jid",
     "target": "target",
+    "atom_features": "cgcnn",  # Use CGCNN atom features (92 features)
 
     "n_train": None,
-    "n_val": 0,
+    "n_val": None,
     "n_test": None,
 
     "train_ratio": None,
@@ -85,12 +70,84 @@ ALIGNN_CONFIG_TEMPLATE = {
         "name": "alignn_atomwise",
         "alignn_layers": 3,
         "gcn_layers": 2,
+        "atom_input_features": 92,  # CGCNN atom features have 92 dimensions
         "hidden_features": 64,
         "output_features": 1,
+        "calculate_gradient": False,
+        "gradwise_weight": 0,
+        "stresswise_weight": 0,
+        "atomwise_weight": 0,
+        "additional_output_features": 0,
+        "additional_output_weight": 0,
     }
 }
 
 # --------------------------- DATASET PREPARATION ----------------------------- #
+
+def check_cif2cell_available() -> bool:
+    """
+    Check if cif2cell is available in the system PATH.
+    
+    On Unix systems, checks directories in os.environ["PATH"].
+    On Windows, also checks common executable extensions.
+    
+    Returns:
+        True if cif2cell is found, False otherwise
+    """
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    
+    # On Windows, also check common executable extensions
+    if os.name == "nt":  # Windows
+        exe_extensions = ["", ".exe", ".bat", ".cmd"]
+    else:
+        exe_extensions = [""]
+    
+    for path_dir in path_dirs:
+        for ext in exe_extensions:
+            cif2cell_path = os.path.join(path_dir, f"cif2cell{ext}")
+            if os.path.isfile(cif2cell_path) and os.access(cif2cell_path, os.X_OK):
+                return True
+    
+    # Also try using 'which' command (Unix) or 'where' command (Windows)
+    try:
+        if os.name == "nt":  # Windows
+            result = subprocess.run(
+                ["where", "cif2cell"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        else:  # Unix/Linux/Mac
+            result = subprocess.run(
+                ["which", "cif2cell"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        if result.returncode == 0 and result.stdout.strip():
+            return True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    
+    return False
+
+
+def detect_id_column(df: pd.DataFrame) -> str:
+    """
+    Detect which ID column exists in the dataframe.
+    Returns 'material_id' if present, otherwise 'jarvis_id'.
+    Raises ValueError if neither exists.
+    """
+    if "material_id" in df.columns:
+        return "material_id"
+    elif "jarvis_id" in df.columns:
+        return "jarvis_id"
+    else:
+        raise ValueError(
+            "CSV must contain either 'material_id' (Materials Project) or "
+            "'jarvis_id' (JARVIS) column."
+        )
+
 
 def prepare_cgcnn_dataset(
     train_csv: Path,
@@ -103,10 +160,10 @@ def prepare_cgcnn_dataset(
 
         out_root/
           id_prop.csv      # id,target
-          JVASP-xxxx.cif
+          <id>.cif
 
     Uses:
-        - id  = row['jarvis_id']
+        - id  = row['material_id'] or row['jarvis_id'] (auto-detected)
         - cif = row['cif_structure']
         - target = row[target_col]
 
@@ -117,7 +174,14 @@ def prepare_cgcnn_dataset(
     df_train = pd.read_csv(train_csv)
     df_test = pd.read_csv(test_csv)
 
-    for col in ["jarvis_id", "cif_structure", target_col]:
+    # Detect ID column
+    id_col = detect_id_column(df_train)
+    if id_col != detect_id_column(df_test):
+        raise ValueError("Train and test CSVs must use the same ID column (material_id or jarvis_id).")
+
+    # Check required columns
+    required_cols = [id_col, "cif_structure", target_col]
+    for col in required_cols:
         if col not in df_train.columns:
             raise ValueError(f"Column '{col}' not in TRAIN CSV.")
         if col not in df_test.columns:
@@ -131,23 +195,24 @@ def prepare_cgcnn_dataset(
     targets = []
 
     for _, row in df_all.iterrows():
-        jid = str(row["jarvis_id"])
+        struct_id = str(row[id_col])
         cif_str = row["cif_structure"]
         if not isinstance(cif_str, str) or not cif_str.strip():
-            raise ValueError(f"Empty/invalid CIF for jarvis_id={jid}")
+            raise ValueError(f"Empty/invalid CIF for {id_col}={struct_id}")
 
-        cif_path = out_root / f"{jid}.cif"
-        with open(cif_path, "w") as f:
+        cif_path = out_root / f"{struct_id}.cif"
+        with open(cif_path, "w", encoding="utf-8") as f:
             f.write(cif_str)
 
-        ids.append(jid)
+        ids.append(struct_id)
         targets.append(row[target_col])
 
+    # CGCNN expects CSV without header row
     id_prop = pd.DataFrame({"id": ids, "target": targets})
-    id_prop.to_csv(out_root / "id_prop.csv", index=False)
+    id_prop.to_csv(out_root / "id_prop.csv", index=False, header=False)
 
-    n_train = (df_all["_split"] == "train").sum()
-    n_test = (df_all["_split"] == "test").sum()
+    n_train = int((df_all["_split"] == "train").sum())
+    n_test = int((df_all["_split"] == "test").sum())
 
     print(f"[CGCNN] Dataset root: {out_root}")
     print(f"[CGCNN] Wrote {len(df_all)} CIFs + id_prop.csv")
@@ -167,16 +232,72 @@ def prepare_alignn_dataset(
 
         out_root/
           id_prop.csv      # jid,target
-          JVASP-xxxx.cif
+          <id>.cif
 
-    Same logic as CGCNN but column named 'jid'.
+    Uses:
+        - jid = row['material_id'] or row['jarvis_id'] (auto-detected)
+        - cif = row['cif_structure']
+        - target = row[target_col]
+
+    Same logic as CGCNN but column named 'jid' for ALIGNN.
+    
+    IMPORTANT: Cleans up LMDB cache files to ensure fresh data when target column changes.
     """
     out_root.mkdir(parents=True, exist_ok=True)
+    
+    # Clean up ALIGNN LMDB cache files to ensure fresh data when target column changes
+    # ALIGNN caches data in LMDB format, and old cache can persist with old target values
+    import glob
+    lmdb_patterns = [
+        "*.lmdb",
+        "sample*.lmdb",
+        "sampletrain_data*.lmdb",
+        "sampleval_data*.lmdb", 
+        "sampletest_data*.lmdb",
+    ]
+    for pattern in lmdb_patterns:
+        for lmdb_path in glob.glob(str(out_root / pattern)):
+            import shutil
+            try:
+                if Path(lmdb_path).is_dir():
+                    shutil.rmtree(lmdb_path)
+                    print(f"[ALIGNN] Removed cached LMDB: {lmdb_path}")
+                elif Path(lmdb_path).is_file():
+                    Path(lmdb_path).unlink()
+                    print(f"[ALIGNN] Removed cached LMDB file: {lmdb_path}")
+            except Exception as e:
+                print(f"[ALIGNN] Warning: Could not remove {lmdb_path}: {e}")
+    
+    # Also remove any data_range files that might cache old statistics
+    for data_range_file in out_root.glob("*data_range*"):
+        try:
+            data_range_file.unlink()
+            print(f"[ALIGNN] Removed cached data_range file: {data_range_file}")
+        except Exception as e:
+            print(f"[ALIGNN] Warning: Could not remove {data_range_file}: {e}")
+    
+    # Also check parent directory (output_dir) for cache files
+    # ALIGNN sometimes creates cache files in the output directory
+    parent_dir = out_root.parent
+    if parent_dir.exists():
+        for data_range_file in parent_dir.glob("*data_range*"):
+            try:
+                data_range_file.unlink()
+                print(f"[ALIGNN] Removed cached data_range file from output dir: {data_range_file}")
+            except Exception as e:
+                pass  # Silently ignore errors in parent directory
 
     df_train = pd.read_csv(train_csv)
     df_test = pd.read_csv(test_csv)
 
-    for col in ["jarvis_id", "cif_structure", target_col]:
+    # Detect ID column
+    id_col = detect_id_column(df_train)
+    if id_col != detect_id_column(df_test):
+        raise ValueError("Train and test CSVs must use the same ID column (material_id or jarvis_id).")
+
+    # Check required columns
+    required_cols = [id_col, "cif_structure", target_col]
+    for col in required_cols:
         if col not in df_train.columns:
             raise ValueError(f"Column '{col}' not in TRAIN CSV.")
         if col not in df_test.columns:
@@ -190,23 +311,25 @@ def prepare_alignn_dataset(
     targets = []
 
     for _, row in df_all.iterrows():
-        jid = str(row["jarvis_id"])
+        struct_id = str(row[id_col])
         cif_str = row["cif_structure"]
         if not isinstance(cif_str, str) or not cif_str.strip():
-            raise ValueError(f"Empty/invalid CIF for jarvis_id={jid}")
+            raise ValueError(f"Empty/invalid CIF for {id_col}={struct_id}")
 
-        cif_path = out_root / f"{jid}.cif"
-        with open(cif_path, "w") as f:
+        cif_filename = f"{struct_id}.cif"
+        cif_path = out_root / cif_filename
+        with open(cif_path, "w", encoding="utf-8") as f:
             f.write(cif_str)
 
-        jids.append(jid)
+        # ALIGNN expects the CIF filename (with .cif extension) in the first column
+        jids.append(cif_filename)
         targets.append(row[target_col])
 
+    # ALIGNN expects CSV without header row
     id_prop = pd.DataFrame({"jid": jids, "target": targets})
-    id_prop.to_csv(out_root / "id_prop.csv", index=False)
-
-    n_train = (df_all["_split"] == "train").sum()
-    n_test = (df_all["_split"] == "test").sum()
+    id_prop.to_csv(out_root / "id_prop.csv", index=False, header=False)
+    n_train = int((df_all["_split"] == "train").sum())
+    n_test = int((df_all["_split"] == "test").sum())
 
     print(f"[ALIGNN] Dataset root: {out_root}")
     print(f"[ALIGNN] Wrote {len(df_all)} CIFs + id_prop.csv")
@@ -214,102 +337,106 @@ def prepare_alignn_dataset(
 
     return n_train, n_test
 
-def run_m3gnet_matgl(
+# ----------------------------- UNIFIED TRAINING & INFERENCE ------------------------- #
+
+def train_matgl_model(
+    model_name: str,
     train_csv: Path,
-    test_csv: Path,
     target_col: str,
     work_dir: Path,
     epochs: int = 50,
     batch_size: int = 16,
-):
+) -> Path:
     """
-    Train a MEGNet/M3GNet-style property model from scratch using MatGL on train.csv
-    and evaluate it on test.csv.
-
-    This follows the official MatGL tutorial:
-    "Training a MEGNet Formation Energy Model with PyTorch Lightning"
-    but swaps in your JARVIS-style CSVs instead of the MP dataset.
-
-    - Uses train_csv for training/validation.
-    - Uses test_csv ONLY for final evaluation (MAE + predictions CSV).
-    - Target is taken from `target_col` (e.g. 'formation_energy_peratom').
-
-    Dependencies inside your env:
-        pip install matgl lightning dgl torch pymatgen scikit-learn
+    Train a MatGL model (M3GNet or MEGNet) and save weights.
+    
+    Args:
+        model_name: Either 'm3gnet' or 'megnet'
+        train_csv: Path to training CSV
+        target_col: Name of target property column
+        work_dir: Working directory for outputs
+        epochs: Number of training epochs
+        batch_size: Batch size for training
+    
+    Returns:
+        Path to saved model weights directory
     """
-    import numpy as np
     import torch
     import lightning as L
     from lightning.pytorch.loggers import CSVLogger
     from dgl.data.utils import split_dataset
-    from sklearn.metrics import mean_absolute_error
     from pymatgen.core import Structure
     from torch.utils.data import DataLoader
 
     from matgl.ext._pymatgen_dgl import Structure2Graph, get_element_list
     from matgl.graph._data_dgl import MGLDataset, collate_fn_graph
-    from matgl.layers import BondExpansion
-    from matgl.models import M3GNet
     from matgl.config import DEFAULT_ELEMENTS
-
     from matgl.utils.training import ModelLightningModule
+    
+    if model_name == "m3gnet":
+        from matgl.models import M3GNet
+        ModelClass = M3GNet
+    elif model_name == "megnet":
+        from matgl.models import MEGNet
+        ModelClass = MEGNet
+    else:
+        raise ValueError(f"Unknown MatGL model: {model_name}")
 
-    out_dir = work_dir / "m3gnet_matgl"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = work_dir / f"{model_name}_weights"
+    model_dir.mkdir(parents=True, exist_ok=True)
 
-    # --------------------- Load train / test CSVs --------------------- #
+    # Load training CSV
     df_train = pd.read_csv(train_csv)
-    df_test = pd.read_csv(test_csv)
-
-    for col in ["jarvis_id", "cif_structure", target_col]:
+    
+    # Detect ID column
+    id_col = detect_id_column(df_train)
+    
+    # Check required columns
+    required_cols = [id_col, "cif_structure", target_col]
+    for col in required_cols:
         if col not in df_train.columns:
             raise ValueError(f"Column '{col}' not in TRAIN CSV.")
-        if col not in df_test.columns:
-            raise ValueError(f"Column '{col}' not in TEST CSV.")
 
-    # --------------------- Build training dataset --------------------- #
+    # Build training dataset
     train_structures: list[Structure] = []
     train_targets: list[float] = []
 
-    print("[M3GNet/MEGNet-MatGL] Parsing training structures...")
+    print(f"[{model_name.upper()}] Parsing training structures from {train_csv}...")
     for _, row in df_train.iterrows():
         tgt = row[target_col]
         if pd.isna(tgt):
-            # skip entries without target
             continue
 
         cif_str = row["cif_structure"]
+        struct_id = str(row[id_col])
         if not isinstance(cif_str, str) or not cif_str.strip():
-            print(f"[M3GNet/MEGNet-MatGL] Skipping train row with empty CIF (jarvis_id={row['jarvis_id']})")
+            print(f"[{model_name.upper()}] Skipping train row with empty CIF ({id_col}={struct_id})")
             continue
 
         try:
             struct = Structure.from_str(cif_str, fmt="cif")
         except Exception as e:
-            print(f"[M3GNet/MEGNet-MatGL] Skipping train {row['jarvis_id']}: CIF parse error: {e}")
+            print(f"[{model_name.upper()}] Skipping train {id_col}={struct_id}: CIF parse error: {e}")
             continue
 
         train_structures.append(struct)
         train_targets.append(float(tgt))
 
     if not train_structures:
-        raise RuntimeError("[M3GNet/MEGNet-MatGL] No valid training samples found.")
+        raise RuntimeError(f"[{model_name.upper()}] No valid training samples found.")
 
-    print(f"[M3GNet/MEGNet-MatGL] Training samples: {len(train_structures)}")
+    print(f"[{model_name.upper()}] Training samples: {len(train_structures)}")
 
-    # --------------------- MatGL dataset & loaders --------------------- #
-    # Get element types from training structures and set up converter
+    # Setup MatGL dataset
     elem_list = get_element_list(train_structures)
     converter = Structure2Graph(element_types=elem_list, cutoff=4.0)
 
-    # MatGL dataset: labels dict can have arbitrary key; we'll use "target"
     dataset = MGLDataset(
         structures=train_structures,
         labels={"target": train_targets},
         converter=converter,
     )
 
-    # Split into train/val (we don't use this split's "test"; our real test is test_csv)
     train_data, val_data, _ = split_dataset(
         dataset,
         frac_list=[0.9, 0.1, 0.0],
@@ -332,54 +459,175 @@ def run_m3gnet_matgl(
         collate_fn=collate_fn_graph,
     )
 
-    # --------------------- Define MEGNet model (tutorial-style) --------------------- #
-    bond_expansion = BondExpansion(
-        rbf_type="Gaussian",
-        initial=0.0,
-        final=5.0,
-        num_centers=100,
-        width=0.5,
-    )
-
-    element_types = DEFAULT_ELEMENTS
-    model = M3GNet(
-        element_types=element_types,
+    # Create model
+    model = ModelClass(
+        element_types=DEFAULT_ELEMENTS,
         is_intensive=False,
     )
 
     lit_module = ModelLightningModule(model=model)
 
     logger = CSVLogger(
-        save_dir=str(out_dir),
-        name="MEGNet_training",
+        save_dir=str(model_dir),
+        name="training",
     )
 
     trainer = L.Trainer(
         max_epochs=epochs,
-        accelerator="auto",  # GPU if available
+        accelerator="auto",
         logger=logger,
     )
 
-    print(f"[M3GNet/MEGNet-MatGL] Starting training for {epochs} epochs (batch_size={batch_size})...")
+    print(f"[{model_name.upper()}] Starting training for {epochs} epochs (batch_size={batch_size})...")
     trainer.fit(model=lit_module, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    # --------------------- Save trained model --------------------- #
-    model_export_path = out_dir / "trained_megnet"
+    # Save model weights
+    model_export_path = model_dir / "model"
     model_export_path.mkdir(parents=True, exist_ok=True)
-
-    # MEGNet inherits IOMixIn -> has save()
     model.save(str(model_export_path))
-    print(f"[M3GNet/MEGNet-MatGL] Saved trained model to: {model_export_path}")
+    
+    # Save converter parameters (not the converter itself, as it contains unpicklable objects)
+    # We'll recreate the converter during inference using these parameters
+    import json
+    converter_info = {
+        "element_types": elem_list,
+        "cutoff": 4.0,
+    }
+    converter_path = model_dir / "converter_info.json"
+    with open(converter_path, "w", encoding="utf-8") as f:
+        json.dump(converter_info, f, indent=2)
+    
+    # Save ID column name and model name for inference
+    id_col_path = model_dir / "id_column.txt"
+    with open(id_col_path, "w", encoding="utf-8") as f:
+        f.write(id_col)
+    
+    model_name_path = model_dir / "model_name.txt"
+    with open(model_name_path, "w", encoding="utf-8") as f:
+        f.write(model_name)
+    
+    print(f"[{model_name.upper()}] Saved trained model to: {model_export_path}")
+    return model_export_path
 
-    # --------------------- Evaluate on test.csv --------------------- #
-    print("[M3GNet/MEGNet-MatGL] Predicting on test set...")
 
+def train_m3gnet(
+    train_csv: Path,
+    target_col: str,
+    work_dir: Path,
+    epochs: int = 50,
+    batch_size: int = 16,
+) -> Path:
+    """Train M3GNet model and save weights."""
+    return train_matgl_model("m3gnet", train_csv, target_col, work_dir, epochs, batch_size)
+
+
+def train_megnet(
+    train_csv: Path,
+    target_col: str,
+    work_dir: Path,
+    epochs: int = 50,
+    batch_size: int = 16,
+) -> Path:
+    """Train MEGNet model and save weights."""
+    return train_matgl_model("megnet", train_csv, target_col, work_dir, epochs, batch_size)
+
+
+def inference_matgl_model(
+    model_name: str,
+    test_csv: Path,
+    target_col: str,
+    model_path: Path,
+    work_dir: Path,
+    batch_size: int = 16,
+) -> Path:
+    """
+    Run inference using saved MatGL model weights (M3GNet or MEGNet).
+    
+    Args:
+        model_name: Either 'm3gnet' or 'megnet'
+        test_csv: Path to test CSV
+        target_col: Name of target property column
+        model_path: Path to saved model directory
+        work_dir: Working directory for outputs
+        batch_size: Batch size for inference
+    
+    Returns:
+        Path to predictions CSV file
+    """
+    import torch
+    from sklearn.metrics import mean_absolute_error
+    from pymatgen.core import Structure
+    from torch.utils.data import DataLoader
+
+    from matgl.graph._data_dgl import MGLDataset, collate_fn_graph
+    
+    if model_name == "m3gnet":
+        from matgl.models import M3GNet
+        ModelClass = M3GNet
+    elif model_name == "megnet":
+        from matgl.models import MEGNet
+        ModelClass = MEGNet
+    else:
+        raise ValueError(f"Unknown MatGL model: {model_name}")
+
+    # Load test CSV
+    df_test = pd.read_csv(test_csv)
+    
+    # Load ID column name and model name from training (or detect if not saved)
+    id_col_path = model_path.parent / "id_column.txt"
+    if id_col_path.exists():
+        with open(id_col_path, "r", encoding="utf-8") as f:
+            id_col = f.read().strip()
+    else:
+        # Fallback: detect from test CSV
+        id_col = detect_id_column(df_test)
+        print(f"[{model_name.upper()}] Warning: ID column not saved from training, detected: {id_col}")
+    
+    # Verify model name matches
+    model_name_path = model_path.parent / "model_name.txt"
+    if model_name_path.exists():
+        with open(model_name_path, "r", encoding="utf-8") as f:
+            saved_model_name = f.read().strip()
+        if saved_model_name != model_name:
+            print(f"[{model_name.upper()}] Warning: Model name mismatch. Expected {model_name}, found {saved_model_name}")
+    
+    # Check required columns
+    required_cols = [id_col, "cif_structure", target_col]
+    for col in required_cols:
+        if col not in df_test.columns:
+            raise ValueError(f"Column '{col}' not in TEST CSV.")
+
+    # Load converter info and recreate converter
+    converter_info_path = model_path.parent / "converter_info.json"
+    if not converter_info_path.exists():
+        raise FileNotFoundError(
+            f"Converter info not found at {converter_info_path}. "
+            "Model may not have been trained properly."
+        )
+    
+    import json
+    with open(converter_info_path, "r", encoding="utf-8") as f:
+        converter_info = json.load(f)
+    
+    # Recreate the converter using saved parameters
+    from matgl.ext._pymatgen_dgl import Structure2Graph
+    converter = Structure2Graph(
+        element_types=converter_info["element_types"],
+        cutoff=converter_info["cutoff"],
+    )
+
+    # Load model
+    model = ModelClass.load(str(model_path))
+    model.eval()
+
+    # Build test dataset
+    print(f"[{model_name.upper()}] Parsing test structures from {test_csv}...")
     test_structures: list[Structure] = []
     test_targets: list[float] = []
     test_ids: list[str] = []
 
     for _, row in df_test.iterrows():
-        jid = str(row["jarvis_id"])
+        struct_id = str(row[id_col])
         cif_str = row["cif_structure"]
         tgt = row[target_col]
 
@@ -387,23 +635,22 @@ def run_m3gnet_matgl(
             continue
 
         if not isinstance(cif_str, str) or not cif_str.strip():
-            print(f"[M3GNet/MEGNet-MatGL] Skipping test {jid}: empty/invalid CIF.")
+            print(f"[{model_name.upper()}] Skipping test {id_col}={struct_id}: empty/invalid CIF.")
             continue
 
         try:
             struct = Structure.from_str(cif_str, fmt="cif")
         except Exception as e:
-            print(f"[M3GNet/MEGNet-MatGL] Skipping test {jid}: CIF parse error: {e}")
+            print(f"[{model_name.upper()}] Skipping test {id_col}={struct_id}: CIF parse error: {e}")
             continue
 
         test_structures.append(struct)
         test_targets.append(float(tgt))
-        test_ids.append(jid)
+        test_ids.append(struct_id)
 
     if not test_structures:
-        raise RuntimeError("[M3GNet/MEGNet-MatGL] No valid test samples to evaluate.")
+        raise RuntimeError(f"[{model_name.upper()}] No valid test samples to evaluate.")
 
-    # Build a MatGL dataset for test structures (same converter & element types)
     test_dataset = MGLDataset(
         structures=test_structures,
         labels={"target": test_targets},
@@ -418,41 +665,57 @@ def run_m3gnet_matgl(
         collate_fn=collate_fn_graph,
     )
 
-    model.eval()
+    # Run inference
+    print(f"[{model_name.upper()}] Running inference on test set...")
     preds: list[float] = []
 
     with torch.no_grad():
         for batch in test_loader:
-            # collate_fn_graph returns: (graph, edge_feat, node_feat, state_feat, labels_dict)
-            g, edge_feat, node_feat, state_feat, labels_dict = batch
+            g, edge_feat, node_feat, state_feat, _ = batch
             out = model(g, edge_feat, node_feat, state_feat)
-            # out shape: (batch_size, 1)
             preds.extend(out.cpu().numpy().ravel().tolist())
 
-    # Sanity check alignment
-    if len(preds) != len(test_targets):
-        print(
-            f"[M3GNet/MEGNet-MatGL] WARNING: #predictions ({len(preds)}) "
-            f"!= #test_targets ({len(test_targets)}). Truncating to min length."
-        )
-        n = min(len(preds), len(test_targets), len(test_ids))
-        preds = preds[:n]
-        test_targets = test_targets[:n]
-        test_ids = test_ids[:n]
+    # Align predictions with targets
+    n = min(len(preds), len(test_targets), len(test_ids))
+    preds = preds[:n]
+    test_targets = test_targets[:n]
+    test_ids = test_ids[:n]
 
     mae = mean_absolute_error(test_targets, preds)
-    print(f"[M3GNet/MEGNet-MatGL] Test MAE on {len(test_targets)} structures: {mae:.6f} (same units as {target_col})")
+    print(f"[{model_name.upper()}] Test MAE on {len(test_targets)} structures: {mae:.6f}")
 
-    pred_df = pd.DataFrame(
-        {
-            "jarvis_id": test_ids,
-            "y_true": test_targets,
-            "y_pred": preds,
-        }
-    )
-    pred_path = out_dir / "m3gnet_trained_predictions.csv"
+    # Save predictions (use the detected ID column name)
+    pred_df = pd.DataFrame({
+        id_col: test_ids,
+        "y_true": test_targets,
+        "y_pred": preds,
+    })
+    pred_path = work_dir / f"{model_name}_predictions.csv"
     pred_df.to_csv(pred_path, index=False)
-    print(f"[M3GNet/MEGNet-MatGL] Saved predictions to: {pred_path}")
+    print(f"[{model_name.upper()}] Saved predictions to: {pred_path}")
+    return pred_path
+
+
+def inference_m3gnet(
+    test_csv: Path,
+    target_col: str,
+    model_path: Path,
+    work_dir: Path,
+    batch_size: int = 16,
+) -> Path:
+    """Run inference using saved M3GNet model weights."""
+    return inference_matgl_model("m3gnet", test_csv, target_col, model_path, work_dir, batch_size)
+
+
+def inference_megnet(
+    test_csv: Path,
+    target_col: str,
+    model_path: Path,
+    work_dir: Path,
+    batch_size: int = 16,
+) -> Path:
+    """Run inference using saved MEGNet model weights."""
+    return inference_matgl_model("megnet", test_csv, target_col, model_path, work_dir, batch_size)
 
 
 
@@ -464,6 +727,8 @@ def run_alignn(
     n_test: int,
     output_dir: Path,
     alignn_root: Path,
+    epochs: int = 10,
+    batch_size: int = 16,
 ):
     """
     Run ALIGNN using the cloned repo at `alignn_root`, without needing pip install.
@@ -473,26 +738,77 @@ def run_alignn(
     so that Python can find alignn/alignn/train.py.
     """
     import json
-    import subprocess
     import os
+
+    # Check if cif2cell is available (jarvis-tools may need it)
+    if not check_cif2cell_available():
+        print(
+            "[ALIGNN] WARNING: cif2cell is not found in system PATH. "
+            "jarvis-tools may require cif2cell for some operations. "
+            "If you encounter errors, install cif2cell:\n"
+            "  pip install cif2cell\n"
+            "  or\n"
+            "  conda install -c conda-forge cif2cell\n"
+            "Continuing anyway..."
+        )
 
     # 1. Build config from our in-script template
     cfg = json.loads(json.dumps(ALIGNN_CONFIG_TEMPLATE))  # deep copy
 
-    cfg["n_train"] = int(n_train)
-    cfg["n_val"] = 0
-    cfg["n_test"] = int(n_test)
+    # Split training data: use 90% for training, 10% for validation
+    # This avoids the ALIGNN bug where val_loader.dataset is None when n_val=0
+    # We split n_train into train + val, and keep n_test separate
+    # Convert to native Python ints to avoid JSON serialization issues with numpy/pandas types
+    n_train_int = int(n_train)
+    n_test_int = int(n_test)
+    
+    # Ensure we have enough samples for both training and validation
+    # Need at least 2 samples: 1 for training, 1 for validation
+    if n_train_int < 2:
+        raise ValueError(
+            f"Training set too small: {n_train_int} samples. "
+            "Need at least 2 samples (1 for training, 1 for validation)."
+        )
+    
+    # Calculate validation size (10% of training, but at least 1)
+    val_size = max(1, int(n_train_int * 0.1))
+    # Ensure training size is at least 1
+    actual_train_size = max(1, n_train_int - val_size)
+    
+    # If actual_train_size is too small, adjust val_size
+    if actual_train_size < 1:
+        actual_train_size = n_train_int - 1
+        val_size = 1
+    
+    print(f"[ALIGNN] Splitting {n_train_int} training samples: {actual_train_size} train, {val_size} validation")
+    
+    # Ensure training size is large enough for at least one batch
+    # This prevents steps_per_epoch from being 0
+    if actual_train_size < cfg.get("batch_size", 16):
+        print(
+            f"[ALIGNN] WARNING: Training size ({actual_train_size}) is smaller than batch size ({cfg.get('batch_size', 16)}). "
+            "This may cause issues. Consider reducing batch_size or increasing training data."
+        )
+    
+    # Use fixed sizes to respect the train/test split we've already made
+    cfg["n_train"] = actual_train_size
+    cfg["n_val"] = val_size
+    cfg["n_test"] = n_test_int
     cfg["train_ratio"] = None
     cfg["val_ratio"] = None
     cfg["test_ratio"] = None
     cfg["keep_data_order"] = True
 
+    # Update batch_size and epochs from arguments
+    cfg["batch_size"] = batch_size
+    cfg["epochs"] = epochs
+    
     cfg["id_tag"] = "jid"
     cfg["target"] = "target"
     cfg["output_dir"] = str(output_dir)
 
     config_path = dataset_root / "config_alignn.json"
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
     print(f"[ALIGNN] Wrote config: {config_path}")
@@ -506,8 +822,24 @@ def run_alignn(
     env["PYTHONPATH"] = (
         alignn_root_abs if not existing_pp else alignn_root_abs + os.pathsep + existing_pp
     )
+    
+    # Force single-process execution to avoid pickle errors with Environment objects
+    # ALIGNN's multiprocessing tries to pickle Atoms objects which contain Environment objects
+    # Setting CUDA_VISIBLE_DEVICES to only the first GPU forces world_size=1
+    if "CUDA_VISIBLE_DEVICES" not in env:
+        # If not set, use only the first GPU (device 0)
+        # This forces ALIGNN to use single-process mode
+        import torch
+        try:
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                env["CUDA_VISIBLE_DEVICES"] = "0"
+                print("[ALIGNN] Limiting to GPU 0 to force single-process mode (avoids pickle errors with Environment objects)")
+        except Exception:
+            # If torch is not available or there's an error, continue without setting
+            pass
 
     # 3. Call the module from the cloned repo
+    
     cmd = [
         "python",
         "-m",
@@ -515,6 +847,7 @@ def run_alignn(
         "--root_dir", str(dataset_root),
         "--config", str(config_path),
         "--output_dir", str(output_dir),
+        "--file_format", "cif",
     ]
     print(f"[ALIGNN] Running with PYTHONPATH={env['PYTHONPATH']}:")
     print("         " + " ".join(cmd))
@@ -572,7 +905,9 @@ def run_cgcnn(
         str(dataset_root),
     ]
     print(f"[CGCNN] Running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, check=True)
+    if result.returncode != 0:
+        raise RuntimeError("CGCNN training failed.")
     print("[CGCNN] Done. Check cgcnn/ outputs for model & test results.")
 
 
@@ -580,21 +915,15 @@ def run_cgcnn(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run CGCNN / ALIGNN / M3GNet on JARVIS-style CSVs "
-                    "(jarvis_id, cif_structure, many properties)."
+        description="Train and test GNN models on Materials Project or JARVIS CSVs. "
+                    "The script automatically detects material_id (MP) or jarvis_id (JARVIS) columns. "
+                    "It trains the model, saves weights, and runs inference."
     )
     parser.add_argument(
-        "--backend",
-        choices=["cgcnn", "alignn", "m3gnet", "both", "all"],
+        "--model",
+        choices=["m3gnet", "megnet", "alignn", "cgcnn"],
         required=True,
-        help=(
-            "Which backend(s) to run. "
-            "'cgcnn'  = CGCNN only, "
-            "'alignn' = ALIGNN only, "
-            "'m3gnet' = train a fresh M3GNet (MatGL) model on train.csv and evaluate on test.csv, "
-            "'both'   = CGCNN + ALIGNN, "
-            "'all'    = CGCNN + ALIGNN + M3GNet."
-        ),
+        help="GNN model to train and test: 'm3gnet', 'megnet', 'alignn', or 'cgcnn'"
     )
     parser.add_argument(
         "--train-csv",
@@ -618,22 +947,27 @@ def parse_args():
         "--work-dir",
         type=str,
         required=True,
-        help="Working directory where datasets and runs will be created.",
+        help="Working directory where model weights and outputs will be saved.",
     )
 
-    # CGCNN-specific
+    # CGCNN-specific (required if model=cgcnn)
     parser.add_argument(
         "--cgcnn-root",
         type=str,
-        help="Path to CGCNN repo root (must contain main.py). Required for backend=cgcnn or both.",
+        help="Path to CGCNN repo root (must contain main.py). Required for model=cgcnn.",
     )
     parser.add_argument(
         "--atom-init",
         type=str,
-        help="Path to atom_init.json (e.g. cgcnn/data/sample-regression/atom_init.json).",
+        help="Path to atom_init.json. Required for model=cgcnn.",
     )
 
-    # ALIGNN-specific
+    # ALIGNN-specific (required if model=alignn)
+    parser.add_argument(
+        "--alignn-root",
+        type=str,
+        help="Path to the ALIGNN repo clone. Required for model=alignn.",
+    )
     parser.add_argument(
         "--alignn-outdir",
         type=str,
@@ -641,26 +975,189 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--alignn-root",
-        type=str,
-        required=False,
-        help="Path to the ALIGNN repo clone (directory containing alignn/ and scripts/).",
-    )
-
-    parser.add_argument(
-        "--m3gnet-epochs",
+        "--epochs",
         type=int,
         default=50,
-        help="Number of epochs for M3GNet training (default: 50).",
+        help="Number of training epochs (default: 50).",
     )
     parser.add_argument(
-        "--m3gnet-batch-size",
+        "--batch-size",
         type=int,
         default=16,
-        help="Batch size for M3GNet training (default: 16).",
+        help="Batch size for training and inference (default: 16).",
     )
 
     return parser.parse_args()
+
+
+def train_and_test_gnn(
+    model_type: str,
+    train_csv: Path,
+    test_csv: Path,
+    target_col: str,
+    work_dir: Path,
+    epochs: int = 50,
+    batch_size: int = 16,
+    **kwargs
+):
+    """
+    Unified function to train a GNN model, save weights, and run inference.
+    
+    Args:
+        model_type: Type of GNN model ('m3gnet', 'alignn', 'cgcnn')
+        train_csv: Path to training CSV
+        test_csv: Path to test CSV
+        target_col: Name of target property column
+        work_dir: Working directory for outputs
+        epochs: Number of training epochs
+        batch_size: Batch size for training/inference
+        **kwargs: Additional model-specific arguments
+    """
+    print("\n" + "=" * 80)
+    print(f"Training {model_type.upper()} model on target: {target_col}")
+    print("=" * 80)
+    
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    if model_type == "m3gnet":
+        # Train M3GNet
+        model_path = train_m3gnet(
+            train_csv=train_csv,
+            target_col=target_col,
+            work_dir=work_dir,
+            epochs=epochs,
+            batch_size=batch_size,
+        )
+        
+        # Run inference
+        inference_m3gnet(
+            test_csv=test_csv,
+            target_col=target_col,
+            model_path=model_path,
+            work_dir=work_dir,
+            batch_size=batch_size,
+        )
+        
+    elif model_type == "megnet":
+        # Train MEGNet
+        model_path = train_megnet(
+            train_csv=train_csv,
+            target_col=target_col,
+            work_dir=work_dir,
+            epochs=epochs,
+            batch_size=batch_size,
+        )
+        
+        # Run inference
+        inference_megnet(
+            test_csv=test_csv,
+            target_col=target_col,
+            model_path=model_path,
+            work_dir=work_dir,
+            batch_size=batch_size,
+        )
+        
+    elif model_type == "alignn":
+        if "alignn_root" not in kwargs or kwargs["alignn_root"] is None:
+            raise ValueError("For ALIGNN, provide --alignn-root.")
+        
+        alignn_root = Path(kwargs["alignn_root"])
+        alignn_dataset_root = work_dir / "alignn_dataset"
+        
+        # Prepare dataset (this will clean up any cached LMDB/data_range files)
+        n_train, n_test = prepare_alignn_dataset(
+            train_csv=train_csv,
+            test_csv=test_csv,
+            target_col=target_col,
+            out_root=alignn_dataset_root,
+        )
+        
+        # Train (ALIGNN saves weights internally and runs inference automatically)
+        # Note: ALIGNN automatically runs inference on test set during training
+        # if write_predictions is True (which is the default)
+        outdir = kwargs.get("alignn_outdir")
+        if outdir is None:
+            outdir = work_dir  # Default to work_dir if not specified
+        else:
+            outdir = Path(outdir)
+        
+        # Also clean up any old prediction files in output directory to avoid confusion
+        # when target column changes
+        for old_pred_file in Path(outdir).glob("prediction_results_*.csv"):
+            try:
+                old_pred_file.unlink()
+                print(f"[ALIGNN] Removed old prediction file: {old_pred_file}")
+            except Exception as e:
+                pass  # Silently ignore if file doesn't exist
+        
+        run_alignn(
+            dataset_root=alignn_dataset_root,
+            n_train=n_train,
+            n_test=n_test,
+            output_dir=Path(outdir),
+            alignn_root=alignn_root,
+            epochs=epochs,
+            batch_size=batch_size,
+        )
+        
+        # Verify that predictions were written
+        # ALIGNN writes predictions to output_dir/prediction_results_test_set.csv
+        pred_file = Path(outdir) / "prediction_results_test_set.csv"
+        if pred_file.exists():
+            print(f"[ALIGNN] ✓ Test predictions saved to: {pred_file}")
+            # Show a preview of the predictions
+            try:
+                import pandas as pd
+                pred_df = pd.read_csv(pred_file)
+                print(f"[ALIGNN]   Predictions shape: {pred_df.shape}")
+                if len(pred_df) > 0:
+                    print(f"[ALIGNN]   Columns: {list(pred_df.columns)}")
+            except Exception:
+                pass
+        else:
+            print(f"[ALIGNN] ⚠ Warning: Test predictions not found at {pred_file}")
+            print(f"[ALIGNN]   Check {outdir} for other prediction files")
+            # List files in output directory to help debug
+            try:
+                files = list(Path(outdir).glob("*.csv"))
+                if files:
+                    print(f"[ALIGNN]   Found CSV files: {[f.name for f in files]}")
+            except Exception:
+                pass
+        
+        print(f"[ALIGNN] Model weights and predictions saved to: {outdir}")
+        
+    elif model_type == "cgcnn":
+        if "cgcnn_root" not in kwargs or kwargs["cgcnn_root"] is None:
+            raise ValueError("For CGCNN, provide --cgcnn-root and --atom-init.")
+        if "atom_init" not in kwargs or kwargs["atom_init"] is None:
+            raise ValueError("For CGCNN, provide --atom-init.")
+        
+        cgcnn_root = Path(kwargs["cgcnn_root"])
+        atom_init = Path(kwargs["atom_init"])
+        cgcnn_dataset_root = work_dir / "cgcnn_dataset"
+        
+        # Prepare dataset
+        n_train, n_test = prepare_cgcnn_dataset(
+            train_csv=train_csv,
+            test_csv=test_csv,
+            target_col=target_col,
+            out_root=cgcnn_dataset_root,
+        )
+        
+        # Train (CGCNN saves weights internally)
+        run_cgcnn(
+            dataset_root=cgcnn_dataset_root,
+            n_train=n_train,
+            n_test=n_test,
+            cgcnn_root=cgcnn_root,
+            atom_init=atom_init,
+        )
+        
+        print(f"[CGCNN] Model weights and predictions saved to: {cgcnn_dataset_root}")
+    
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
 
 
 def main():
@@ -669,77 +1166,33 @@ def main():
     train_csv = Path(args.train_csv)
     test_csv = Path(args.test_csv)
     work_dir = Path(args.work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    backend = args.backend.lower()
     target_col = args.target_col
+    model_type = args.model.lower()
 
-    # -------------------- CGCNN dataset + run --------------------- #
-    if backend in ["cgcnn", "both"]:
-        if args.cgcnn_root is None or args.atom_init is None:
-            raise ValueError("For CGCNN, provide --cgcnn-root and --atom-init.")
-        cgcnn_root = Path(args.cgcnn_root)
-        atom_init = Path(args.atom_init)
+    # Prepare kwargs for model-specific arguments
+    kwargs = {}
+    if model_type == "alignn":
+        kwargs["alignn_root"] = getattr(args, "alignn_root", None)
+        kwargs["alignn_outdir"] = getattr(args, "work_dir", None)
+    elif model_type == "cgcnn":
+        kwargs["cgcnn_root"] = getattr(args, "cgcnn_root", None)
+        kwargs["atom_init"] = getattr(args, "atom_init", None)
 
-        cgcnn_dataset_root = work_dir / "cgcnn_dataset"
-        n_train_cgcnn, n_test_cgcnn = prepare_cgcnn_dataset(
-            train_csv=train_csv,
-            test_csv=test_csv,
-            target_col=target_col,
-            out_root=cgcnn_dataset_root,
-        )
-        run_cgcnn(
-            dataset_root=cgcnn_dataset_root,
-            n_train=n_train_cgcnn,
-            n_test=n_test_cgcnn,
-            cgcnn_root=cgcnn_root,
-            atom_init=atom_init,
-        )
-
-    # -------------------- ALIGNN dataset + run -------------------- #
-    if backend in ["alignn", "both"]:
-        if args.alignn_root is None:
-            raise ValueError(
-                "You selected backend=alignn or both, but did not provide --alignn-root.\n"
-                "Example: --alignn-root ./alignn"
-            )
-
-        alignn_root = Path(args.alignn_root)
-
-        alignn_dataset_root = work_dir / "alignn_dataset"
-        n_train_alignn, n_test_alignn = prepare_alignn_dataset(
-            train_csv=train_csv,
-            test_csv=test_csv,
-            target_col=target_col,
-            out_root=alignn_dataset_root,
-        )
-
-        outdir = Path(args.alignn_outdir) if hasattr(args, "alignn_outdir") and args.alignn_outdir \
-                else (work_dir / "alignn_runs")
-
-        run_alignn(
-            dataset_root=alignn_dataset_root,
-            n_train=n_train_alignn,
-            n_test=n_test_alignn,
-            output_dir=outdir,
-            alignn_root=alignn_root,
-        )
-
-    # -------------------- M3GNet (MatGL) run -------------------- #
-    # -------------------- M3GNet (MatGL) run -------------------- #
-    if backend in ["m3gnet", "all"]:
-        print("\n" + "#" * 80)
-        print(f"Running M3GNet (MatGL) training from scratch on target: {target_col}")
-        print("#" * 80)
-
-        run_m3gnet_matgl(
-            train_csv=train_csv,
-            test_csv=test_csv,
-            target_col=target_col,
-            work_dir=work_dir,
-            epochs=args.m3gnet_epochs,
-            batch_size=args.m3gnet_batch_size,
-        )
+    # Train and test the model
+    train_and_test_gnn(
+        model_type=model_type,
+        train_csv=train_csv,
+        test_csv=test_csv,
+        target_col=target_col,
+        work_dir=work_dir,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        **kwargs
+    )
+    
+    print("\n" + "=" * 80)
+    print("Training and inference completed successfully!")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
